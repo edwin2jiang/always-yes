@@ -6,9 +6,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let log = Logger(subsystem: "ai.slaptoyes", category: "menubar")
     private let store = ConfigStore()
     private let client = DaemonClient()
+    private let hotkeys = HotkeyManager()
+    private let feedback = FeedbackPresenter()
     private var statusItem: NSStatusItem!
     private var pulseTimer: Timer?
     private var sensitivityCommitTimer: Timer?
+    private var shortcutSettings: ShortcutSettingsWindowController?
 
     func start() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -18,18 +21,25 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             btn.toolTip = "Always Yes"
         }
 
-        rebuildMenu()
-        client.onSlap = { [weak self] ev in self?.handleSlap(ev) }
-        client.connect()
-        client.push(config: store.config.daemonConfig())
-
         // First-run install attempt; ignore failures so user can retry from menu.
         if DaemonInstaller.status == .notRegistered {
             try? DaemonInstaller.install()
         }
 
+        rebuildMenu()
+        hotkeys.onFire = { [weak self] actionID in
+            self?.performActionIfAllowed(actionID: actionID, source: "hotkey")
+        }
+        hotkeys.register(actions: store.config.textActions)
+        client.onSlap = { [weak self] ev in self?.handleSlap(ev) }
+        client.onConnected = { [weak self] in
+            guard let self = self else { return }
+            self.client.push(config: self.store.config.daemonConfig())
+        }
+        client.connect()
+
         // Trigger accessibility prompt if needed.
-        Permissions.requestAccessibility()
+        Permissions.requestAccessibilityIfNeeded()
     }
 
     private func rebuildMenu() {
@@ -62,6 +72,51 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let modeRoot = NSMenuItem(title: "应用范围", action: nil, keyEquivalent: "")
         modeRoot.submenu = modeMenu
         menu.addItem(modeRoot)
+
+        let slapMenu = NSMenu()
+        for action in store.config.textActions {
+            let item = NSMenuItem(title: action.menuTitle, action: #selector(setSlapAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = action.id
+            item.state = (store.config.slapActionID == action.id) ? .on : .off
+            slapMenu.addItem(item)
+        }
+        let slapRoot = NSMenuItem(title: "拍击动作", action: nil, keyEquivalent: "")
+        slapRoot.submenu = slapMenu
+        menu.addItem(slapRoot)
+
+        let shortcutsMenu = NSMenu()
+        for action in store.config.textActions where action.enabled {
+            let item = NSMenuItem(title: "\(action.menuTitle)  \(action.hotkey.displayName)",
+                                  action: #selector(runShortcutAction(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = action.id
+            shortcutsMenu.addItem(item)
+        }
+        shortcutsMenu.addItem(NSMenuItem.separator())
+        let editShortcuts = NSMenuItem(title: "编辑快捷键与输入内容…",
+                                       action: #selector(openShortcutSettings),
+                                       keyEquivalent: ",")
+        editShortcuts.target = self
+        shortcutsMenu.addItem(editShortcuts)
+        let shortcutsRoot = NSMenuItem(title: "快捷键", action: nil, keyEquivalent: "")
+        shortcutsRoot.submenu = shortcutsMenu
+        menu.addItem(shortcutsRoot)
+
+        let feedbackMenu = NSMenu()
+        for mode in FeedbackMode.allCases {
+            let item = NSMenuItem(title: mode.menuTitle, action: #selector(setFeedbackMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = mode.rawValue
+            item.state = (store.config.feedbackMode == mode) ? .on : .off
+            feedbackMenu.addItem(item)
+        }
+        let feedbackRoot = NSMenuItem(title: "执行反馈", action: nil, keyEquivalent: "")
+        feedbackRoot.submenu = feedbackMenu
+        menu.addItem(feedbackRoot)
+
+        menu.addItem(NSMenuItem.separator())
 
         let install = NSMenuItem(title: "守护进程：\(DaemonInstaller.statusDescription)",
                                   action: #selector(reinstallDaemon), keyEquivalent: "")
@@ -118,20 +173,44 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 log.info("ignored: front=\(bid, privacy: .public) not whitelisted")
                 return
             }
-            sendEnterOrPrompt()
+            performAction(id: cfg.slapActionID)
         case .global:
-            sendEnterOrPrompt()
+            performAction(id: cfg.slapActionID)
         }
     }
 
-    private func sendEnterOrPrompt() {
-        guard Permissions.isAccessibilityTrusted else {
-            log.error("accessibility not trusted; prompting")
-            Permissions.requestAccessibility()
+    private func performActionIfAllowed(actionID: String, source: String) {
+        let cfg = store.config
+        if cfg.paused {
+            log.info("ignored \(source, privacy: .public): paused")
             return
         }
-        let ok = KeyPress.sendEnter()
-        log.info("sendEnter=\(ok, privacy: .public)")
+        switch cfg.mode {
+        case .whitelist:
+            let bid = Frontmost.bundleID()
+            guard cfg.apps.contains(bid) else {
+                log.info("ignored \(source, privacy: .public): front=\(bid, privacy: .public) not whitelisted")
+                return
+            }
+            performAction(id: actionID)
+        case .global:
+            performAction(id: actionID)
+        }
+    }
+
+    private func performAction(id: String) {
+        guard Permissions.isAccessibilityTrusted else {
+            log.error("accessibility not trusted; ignoring action")
+            return
+        }
+        let action = store.config.action(id: id)
+        KeyPress.send(text: action.input, pressReturn: action.autoPressReturn) { [weak self] ok in
+            guard let self = self else { return }
+            self.log.info("performAction \(action.id, privacy: .public)=\(ok, privacy: .public)")
+            if ok {
+                self.showFeedback(self.feedbackMessage(for: action))
+            }
+        }
     }
 
     private func pulse() {
@@ -161,8 +240,61 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         rebuildMenu()
     }
 
+    @objc private func setSlapAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        var cfg = store.config
+        cfg.slapActionID = id
+        store.save(cfg)
+        rebuildMenu()
+    }
+
+    @objc private func setFeedbackMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let mode = FeedbackMode(rawValue: raw) else { return }
+        var cfg = store.config
+        cfg.feedbackMode = mode
+        store.save(cfg)
+        rebuildMenu()
+        showFeedback("执行反馈：\(mode.menuTitle)")
+    }
+
+    @objc private func runShortcutAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        performActionIfAllowed(actionID: id, source: "menu")
+    }
+
+    @objc private func openShortcutSettings() {
+        let controller = ShortcutSettingsWindowController(config: store.config)
+        controller.onSave = { [weak self] cfg in
+            guard let self = self else { return }
+            self.store.save(cfg)
+            self.hotkeys.register(actions: cfg.textActions)
+            self.rebuildMenu()
+            self.showFeedback("快捷键与输入内容已保存")
+        }
+        shortcutSettings = controller
+        controller.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func showFeedback(_ message: String) {
+        feedback.show(message, mode: store.config.feedbackMode, statusItem: statusItem)
+    }
+
+    private func feedbackMessage(for action: TextAction) -> String {
+        let text = action.input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty {
+            return action.autoPressReturn ? "已执行：按回车" : "已执行：\(action.title)"
+        }
+        let preview = text.count > 28 ? "\(text.prefix(28))…" : text
+        if action.autoPressReturn {
+            return "已执行：输入 \(preview) 并回车"
+        }
+        return "已执行：输入 \(preview)"
+    }
+
     @objc private func requestAX() {
-        if !Permissions.requestAccessibility() {
+        if !Permissions.requestAccessibility(prompt: true) {
             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
         }
         rebuildMenu()
@@ -171,6 +303,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func reinstallDaemon() {
         do {
             try DaemonInstaller.install()
+            client.connect()
         } catch {
             let alert = NSAlert()
             alert.messageText = "守护进程安装失败"

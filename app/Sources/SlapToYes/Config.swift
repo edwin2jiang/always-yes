@@ -5,12 +5,153 @@ enum AppMode: String, Codable {
     case whitelist, global
 }
 
+enum FeedbackMode: String, Codable, CaseIterable {
+    case toast, alert, off
+
+    var menuTitle: String {
+        switch self {
+        case .toast: return "Toast 提醒"
+        case .alert: return "弹窗提醒"
+        case .off: return "关闭"
+        }
+    }
+}
+
+enum HotkeyModifier {
+    static let command: UInt32 = 1 << 8
+    static let shift: UInt32 = 1 << 9
+    static let option: UInt32 = 1 << 11
+    static let control: UInt32 = 1 << 12
+}
+
+struct HotkeySpec: Codable, Equatable {
+    var keyCode: UInt32
+    var modifiers: UInt32
+
+    var displayName: String {
+        var s = ""
+        if modifiers & HotkeyModifier.control != 0 { s += "⌃" }
+        if modifiers & HotkeyModifier.option != 0 { s += "⌥" }
+        if modifiers & HotkeyModifier.shift != 0 { s += "⇧" }
+        if modifiers & HotkeyModifier.command != 0 { s += "⌘" }
+        s += HotkeySpec.keyName(keyCode)
+        return s
+    }
+
+    static let confirm = HotkeySpec(keyCode: 0x24, modifiers: HotkeyModifier.option | HotkeyModifier.shift)
+    static let yes = HotkeySpec(keyCode: 0x10, modifiers: HotkeyModifier.option | HotkeyModifier.shift)
+    static let continuePrompt = HotkeySpec(keyCode: 0x08, modifiers: HotkeyModifier.option | HotkeyModifier.shift)
+
+    static func keyName(_ keyCode: UInt32) -> String {
+        switch keyCode {
+        case 0x24: return "↩"
+        case 0x31: return "Space"
+        default:
+            return keyCodeToLetter.first(where: { $0.value == keyCode })?.key.uppercased() ?? "#\(keyCode)"
+        }
+    }
+
+    static func parse(_ raw: String) -> HotkeySpec? {
+        var normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+
+        let replacements = [
+            "⌘": "+command+",
+            "cmd": "command",
+            "⌃": "+control+",
+            "ctrl": "control",
+            "⌥": "+option+",
+            "alt": "option",
+            "opt": "option",
+            "⇧": "+shift+",
+            "↩": "+return+",
+            "enter": "return",
+            "spacebar": "space",
+        ]
+        for (from, to) in replacements {
+            normalized = normalized.replacingOccurrences(of: from, with: to)
+        }
+        for sep in ["-", "_", ",", " "] {
+            normalized = normalized.replacingOccurrences(of: sep, with: "+")
+        }
+
+        let parts = normalized
+            .split(separator: "+")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+
+        var modifiers: UInt32 = 0
+        var keyCode: UInt32?
+        for part in parts {
+            switch part {
+            case "command", "meta":
+                modifiers |= HotkeyModifier.command
+            case "control":
+                modifiers |= HotkeyModifier.control
+            case "option":
+                modifiers |= HotkeyModifier.option
+            case "shift":
+                modifiers |= HotkeyModifier.shift
+            case "return":
+                keyCode = 0x24
+            case "space":
+                keyCode = 0x31
+            default:
+                if part.count == 1, let code = keyCodeToLetter[part] {
+                    keyCode = code
+                } else {
+                    return nil
+                }
+            }
+        }
+
+        guard modifiers != 0, let keyCode = keyCode else { return nil }
+        return HotkeySpec(keyCode: keyCode, modifiers: modifiers)
+    }
+
+    private static let keyCodeToLetter: [String: UInt32] = [
+        "a": 0x00, "s": 0x01, "d": 0x02, "f": 0x03, "h": 0x04, "g": 0x05,
+        "z": 0x06, "x": 0x07, "c": 0x08, "v": 0x09, "b": 0x0B, "q": 0x0C,
+        "w": 0x0D, "e": 0x0E, "r": 0x0F, "y": 0x10, "t": 0x11,
+        "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15, "6": 0x16, "5": 0x17,
+        "=": 0x18, "9": 0x19, "7": 0x1A, "-": 0x1B, "8": 0x1C, "0": 0x1D,
+        "]": 0x1E, "o": 0x1F, "u": 0x20, "[": 0x21, "i": 0x22, "p": 0x23,
+        "l": 0x25, "j": 0x26, "'": 0x27, "k": 0x28, ";": 0x29, "\\": 0x2A,
+        ",": 0x2B, "/": 0x2C, "n": 0x2D, "m": 0x2E, ".": 0x2F, "`": 0x32,
+    ]
+}
+
+struct TextAction: Codable, Equatable {
+    var id: String
+    var title: String
+    var input: String
+    var autoPressReturn: Bool = true
+    var hotkey: HotkeySpec
+    var enabled: Bool = true
+
+    var menuTitle: String {
+        if input.isEmpty {
+            return "\(title)（只按回车）"
+        }
+        return "\(title)：\(input)"
+    }
+
+    static let defaults: [TextAction] = [
+        TextAction(id: "confirm", title: "确认 / 继续", input: "", hotkey: .confirm),
+        TextAction(id: "yes", title: "输入 y", input: "y", hotkey: .yes),
+        TextAction(id: "continue", title: "输入 continue", input: "continue", hotkey: .continuePrompt),
+    ]
+}
+
 struct AppConfig: Codable {
     var minAmplitude: Double = 0.144
     var cooldownMs: Int = 600
     var mode: AppMode = .whitelist
     var apps: [String] = AppConfig.defaultApps
     var paused: Bool = false
+    var slapActionID: String = "confirm"
+    var textActions: [TextAction] = TextAction.defaults
+    var feedbackMode: FeedbackMode = .toast
 
     static let defaultApps: [String] = [
         "com.apple.Terminal",
@@ -32,6 +173,34 @@ struct AppConfig: Codable {
 
     func daemonConfig() -> DaemonConfig {
         DaemonConfig(minAmplitude: minAmplitude, cooldownMs: cooldownMs)
+    }
+
+    func action(id: String) -> TextAction {
+        textActions.first(where: { $0.id == id }) ?? textActions.first ?? TextAction.defaults[0]
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case minAmplitude, cooldownMs, mode, apps, paused, slapActionID, textActions, feedbackMode
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        minAmplitude = try c.decodeIfPresent(Double.self, forKey: .minAmplitude) ?? 0.144
+        cooldownMs = try c.decodeIfPresent(Int.self, forKey: .cooldownMs) ?? 600
+        mode = try c.decodeIfPresent(AppMode.self, forKey: .mode) ?? .whitelist
+        apps = try c.decodeIfPresent([String].self, forKey: .apps) ?? AppConfig.defaultApps
+        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
+        slapActionID = try c.decodeIfPresent(String.self, forKey: .slapActionID) ?? "confirm"
+        textActions = try c.decodeIfPresent([TextAction].self, forKey: .textActions) ?? TextAction.defaults
+        feedbackMode = try c.decodeIfPresent(FeedbackMode.self, forKey: .feedbackMode) ?? .toast
+        if textActions.isEmpty {
+            textActions = TextAction.defaults
+        }
+        if !textActions.contains(where: { $0.id == slapActionID }) {
+            slapActionID = textActions[0].id
+        }
     }
 }
 

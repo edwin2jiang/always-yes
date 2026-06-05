@@ -5,25 +5,35 @@ import os
 final class DaemonClient: NSObject, SlapClientProtocol {
     private let log = Logger(subsystem: "ai.slaptoyes", category: "client")
     private var connection: NSXPCConnection?
+    private var reconnectWorkItem: DispatchWorkItem?
     var onSlap: ((SlapEvent) -> Void)?
+    var onConnected: (() -> Void)?
 
     func connect() {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+
         let conn = NSXPCConnection(machServiceName: SlapDaemonMachServiceName, options: .privileged)
         conn.remoteObjectInterface = NSXPCInterface(with: SlapDaemonProtocol.self)
         conn.exportedInterface = NSXPCInterface(with: SlapClientProtocol.self)
         conn.exportedObject = self
-        conn.invalidationHandler = { [weak self] in
-            self?.log.error("xpc: invalidated")
-            self?.connection = nil
+        conn.invalidationHandler = { [weak self, weak conn] in
+            self?.handleDisconnect("invalidated", connection: conn)
         }
-        conn.interruptionHandler = { [weak self] in
-            self?.log.error("xpc: interrupted")
+        conn.interruptionHandler = { [weak self, weak conn] in
+            self?.handleDisconnect("interrupted", connection: conn)
         }
         conn.resume()
         self.connection = conn
 
-        proxy()?.subscribe { ok in
+        proxy(for: conn)?.subscribe { [weak self] ok in
+            guard let self = self else { return }
             self.log.info("subscribe: \(ok, privacy: .public)")
+            if ok {
+                DispatchQueue.main.async { self.onConnected?() }
+            } else {
+                self.scheduleReconnect()
+            }
         }
     }
 
@@ -38,9 +48,34 @@ final class DaemonClient: NSObject, SlapClientProtocol {
     }
 
     private func proxy() -> SlapDaemonProtocol? {
-        connection?.remoteObjectProxyWithErrorHandler { [weak self] err in
+        guard let connection = connection else { return nil }
+        return proxy(for: connection)
+    }
+
+    private func proxy(for connection: NSXPCConnection) -> SlapDaemonProtocol? {
+        connection.remoteObjectProxyWithErrorHandler { [weak self] err in
             self?.log.error("xpc proxy: \(err.localizedDescription, privacy: .public)")
         } as? SlapDaemonProtocol
+    }
+
+    private func handleDisconnect(_ reason: String, connection disconnected: NSXPCConnection?) {
+        log.error("xpc: \(reason, privacy: .public)")
+        if let disconnected = disconnected, connection !== disconnected {
+            return
+        }
+        connection = nil
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard reconnectWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.reconnectWorkItem = nil
+            self.connect()
+        }
+        reconnectWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: item)
     }
 
     // MARK: SlapClientProtocol
