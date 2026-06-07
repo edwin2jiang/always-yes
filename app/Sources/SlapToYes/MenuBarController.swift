@@ -11,7 +11,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var pulseTimer: Timer?
     private var sensitivityCommitTimer: Timer?
+    private var accessibilityPromptTimer: Timer?
     private var shortcutSettings: ShortcutSettingsWindowController?
+    private var settingsWindow: SettingsWindowController?
 
     func start() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -30,7 +32,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         hotkeys.onFire = { [weak self] actionID in
             self?.performActionIfAllowed(actionID: actionID, source: "hotkey")
         }
-        hotkeys.register(actions: store.config.textActions)
+        hotkeys.register(actions: store.config.activeHotkeyActions)
         client.onSlap = { [weak self] ev in self?.handleSlap(ev) }
         client.onConnected = { [weak self] in
             guard let self = self else { return }
@@ -38,8 +40,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
         client.connect()
 
-        // Trigger accessibility prompt if needed.
-        Permissions.requestAccessibilityIfNeeded()
+        updateAutoAccessibilityPrompting()
     }
 
     private func rebuildMenu() {
@@ -54,10 +55,35 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let pause = NSMenuItem(title: store.config.paused ? "恢复（已暂停）" : "暂停",
-                               action: #selector(togglePause), keyEquivalent: "p")
-        pause.target = self
-        menu.addItem(pause)
+        let panel = NSMenuItem(title: "打开控制面板…", action: #selector(openControlPanel), keyEquivalent: ",")
+        panel.target = self
+        menu.addItem(panel)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let pauseMenu = NSMenu()
+        for (title, key, paused) in [
+            ("全部暂停", "all", store.config.paused),
+            ("暂停拍击动作", "slap", store.config.pauseSlapActions),
+            ("暂停快捷键", "hotkeys", store.config.pauseHotkeys),
+        ] {
+            let item = NSMenuItem(title: title, action: #selector(togglePauseFlag(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = key
+            item.state = paused ? .on : .off
+            pauseMenu.addItem(item)
+        }
+        let pauseRootTitle: String
+        if store.config.paused {
+            pauseRootTitle = "暂停控制（全部已暂停）"
+        } else if store.config.pauseSlapActions || store.config.pauseHotkeys {
+            pauseRootTitle = "暂停控制（部分已暂停）"
+        } else {
+            pauseRootTitle = "暂停控制"
+        }
+        let pauseRoot = NSMenuItem(title: pauseRootTitle, action: nil, keyEquivalent: "")
+        pauseRoot.submenu = pauseMenu
+        menu.addItem(pauseRoot)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -146,8 +172,20 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             guard let self = self else { return }
             var cfg = self.store.config
             cfg.minAmplitude = v
-            self.store.save(cfg)
-            self.client.push(config: cfg.daemonConfig())
+            self.applyConfig(cfg, feedbackMessage: nil)
+        }
+    }
+
+    private func applyConfig(_ cfg: AppConfig, feedbackMessage: String? = nil) {
+        store.save(cfg)
+        client.push(config: cfg.daemonConfig())
+        hotkeys.register(actions: cfg.activeHotkeyActions)
+        updateAutoAccessibilityPrompting()
+        rebuildMenu()
+        shortcutSettings?.updateConfig(cfg)
+        settingsWindow?.updateConfig(cfg)
+        if let feedbackMessage = feedbackMessage {
+            showFeedback(feedbackMessage)
         }
     }
 
@@ -158,6 +196,28 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
+    private func updateAutoAccessibilityPrompting() {
+        accessibilityPromptTimer?.invalidate()
+        accessibilityPromptTimer = nil
+
+        guard store.config.autoRequestAccessibility, !Permissions.isAccessibilityTrusted else { return }
+        Permissions.requestAccessibilityIfNeeded()
+        accessibilityPromptTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+            guard self.store.config.autoRequestAccessibility, !Permissions.isAccessibilityTrusted else {
+                timer.invalidate()
+                self.accessibilityPromptTimer = nil
+                return
+            }
+            Permissions.requestAccessibilityIfNeeded()
+            self.settingsWindow?.refreshStatus()
+            self.rebuildMenu()
+        }
+    }
+
     // MARK: Slap handling
 
     private func handleSlap(_ ev: SlapEvent) {
@@ -165,7 +225,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         pulse()
 
         let cfg = store.config
-        if cfg.paused { return }
+        if cfg.isSlapPaused { return }
         switch cfg.mode {
         case .whitelist:
             let bid = Frontmost.bundleID()
@@ -181,7 +241,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private func performActionIfAllowed(actionID: String, source: String) {
         let cfg = store.config
-        if cfg.paused {
+        if cfg.isHotkeyPaused {
             log.info("ignored \(source, privacy: .public): paused")
             return
         }
@@ -224,11 +284,20 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     // MARK: Menu actions
 
-    @objc private func togglePause() {
+    @objc private func togglePauseFlag(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
         var cfg = store.config
-        cfg.paused.toggle()
-        store.save(cfg)
-        rebuildMenu()
+        switch key {
+        case "all":
+            cfg.paused.toggle()
+        case "slap":
+            cfg.pauseSlapActions.toggle()
+        case "hotkeys":
+            cfg.pauseHotkeys.toggle()
+        default:
+            return
+        }
+        applyConfig(cfg)
     }
 
     @objc private func setMode(_ sender: NSMenuItem) {
@@ -236,16 +305,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
               let m = AppMode(rawValue: raw) else { return }
         var cfg = store.config
         cfg.mode = m
-        store.save(cfg)
-        rebuildMenu()
+        applyConfig(cfg)
     }
 
     @objc private func setSlapAction(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         var cfg = store.config
         cfg.slapActionID = id
-        store.save(cfg)
-        rebuildMenu()
+        applyConfig(cfg)
     }
 
     @objc private func setFeedbackMode(_ sender: NSMenuItem) {
@@ -253,9 +320,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
               let mode = FeedbackMode(rawValue: raw) else { return }
         var cfg = store.config
         cfg.feedbackMode = mode
-        store.save(cfg)
-        rebuildMenu()
-        showFeedback("执行反馈：\(mode.menuTitle)")
+        applyConfig(cfg, feedbackMessage: "执行反馈：\(mode.menuTitle)")
     }
 
     @objc private func runShortcutAction(_ sender: NSMenuItem) {
@@ -267,12 +332,31 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let controller = ShortcutSettingsWindowController(config: store.config)
         controller.onSave = { [weak self] cfg in
             guard let self = self else { return }
-            self.store.save(cfg)
-            self.hotkeys.register(actions: cfg.textActions)
-            self.rebuildMenu()
-            self.showFeedback("快捷键与输入内容已保存")
+            self.applyConfig(cfg, feedbackMessage: "快捷键与输入内容已保存")
+        }
+        controller.onOpenControlPanel = { [weak self] in
+            self?.openControlPanel()
         }
         shortcutSettings = controller
+        controller.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func openControlPanel() {
+        let controller = settingsWindow ?? SettingsWindowController(config: store.config, configURL: store.url)
+        controller.onSave = { [weak self] cfg in
+            self?.applyConfig(cfg, feedbackMessage: "控制面板设置已保存")
+        }
+        controller.onRequestAccessibility = { [weak self] in
+            self?.requestAX()
+            self?.settingsWindow?.refreshStatus()
+        }
+        controller.onReinstallDaemon = { [weak self] in
+            self?.reinstallDaemon()
+            self?.settingsWindow?.refreshStatus()
+        }
+        settingsWindow = controller
+        controller.updateConfig(store.config)
         controller.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

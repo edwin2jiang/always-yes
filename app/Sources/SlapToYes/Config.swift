@@ -149,9 +149,12 @@ struct AppConfig: Codable {
     var mode: AppMode = .whitelist
     var apps: [String] = AppConfig.defaultApps
     var paused: Bool = false
+    var pauseSlapActions: Bool = false
+    var pauseHotkeys: Bool = false
     var slapActionID: String = "confirm"
     var textActions: [TextAction] = TextAction.defaults
     var feedbackMode: FeedbackMode = .toast
+    var autoRequestAccessibility: Bool = false
 
     static let defaultApps: [String] = [
         "com.apple.Terminal",
@@ -175,12 +178,24 @@ struct AppConfig: Codable {
         DaemonConfig(minAmplitude: minAmplitude, cooldownMs: cooldownMs)
     }
 
+    var isSlapPaused: Bool {
+        paused || pauseSlapActions
+    }
+
+    var isHotkeyPaused: Bool {
+        paused || pauseHotkeys
+    }
+
+    var activeHotkeyActions: [TextAction] {
+        isHotkeyPaused ? [] : textActions
+    }
+
     func action(id: String) -> TextAction {
         textActions.first(where: { $0.id == id }) ?? textActions.first ?? TextAction.defaults[0]
     }
 
     enum CodingKeys: String, CodingKey {
-        case minAmplitude, cooldownMs, mode, apps, paused, slapActionID, textActions, feedbackMode
+        case minAmplitude, cooldownMs, mode, apps, paused, pauseSlapActions, pauseHotkeys, slapActionID, textActions, feedbackMode, autoRequestAccessibility
     }
 
     init() {}
@@ -192,9 +207,12 @@ struct AppConfig: Codable {
         mode = try c.decodeIfPresent(AppMode.self, forKey: .mode) ?? .whitelist
         apps = try c.decodeIfPresent([String].self, forKey: .apps) ?? AppConfig.defaultApps
         paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
+        pauseSlapActions = try c.decodeIfPresent(Bool.self, forKey: .pauseSlapActions) ?? false
+        pauseHotkeys = try c.decodeIfPresent(Bool.self, forKey: .pauseHotkeys) ?? false
         slapActionID = try c.decodeIfPresent(String.self, forKey: .slapActionID) ?? "confirm"
         textActions = try c.decodeIfPresent([TextAction].self, forKey: .textActions) ?? TextAction.defaults
         feedbackMode = try c.decodeIfPresent(FeedbackMode.self, forKey: .feedbackMode) ?? .toast
+        autoRequestAccessibility = try c.decodeIfPresent(Bool.self, forKey: .autoRequestAccessibility) ?? false
         if textActions.isEmpty {
             textActions = TextAction.defaults
         }
@@ -205,7 +223,7 @@ struct AppConfig: Codable {
 }
 
 final class ConfigStore {
-    private let url: URL
+    let url: URL
     private(set) var config: AppConfig
 
     init() {
